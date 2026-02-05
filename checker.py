@@ -15,6 +15,7 @@ URL_SITE = "https://seati.segov.ma.gov.br/procon/agendamento/"
 INTERVALO_ENTRE_DATAS = 1.5          # pausa curta entre checks de datas
 INTERVALO_ENTRE_RODADAS = 300        # 5 minutos
 INTERVALO_POS_ALERTA = 1800          # 30 minutos após alerta
+BACKOFF_BASE = 5                     # segundos base para backoff exponencial
 
 # --- CONFIG E LOGS ---
 load_dotenv()
@@ -30,6 +31,9 @@ TOKEN_TELEGRAM = os.getenv("TOKEN_TELEGRAM")
 CHAT_ID = os.getenv("CHAT_ID")
 UNIDADE = os.getenv("UNIDADE", "85")   # default: Viva Penalva
 SERVICO = os.getenv("SERVICO", "316")  # default: RG Nacional (CIN)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))  # timeout em segundos
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))           # tentativas por data
+DIAS_ALVO_RAW = os.getenv("DIAS_ALVO", "")                 # datas específicas (DD/MM/YYYY,DD/MM/YYYY)
 
 if not TOKEN_TELEGRAM or not CHAT_ID:
     logger.critical("ERRO: Variáveis TOKEN_TELEGRAM ou CHAT_ID não definidas no .env.")
@@ -101,6 +105,42 @@ def interpretar_resposta(response: requests.Response) -> tuple[bool, str]:
         return True, msn or "Horários disponíveis"
     return False, msn or "Sem vagas"
 
+def obter_datas_alvo() -> list[str]:
+    """Retorna lista de datas a verificar. Usa DIAS_ALVO se definido, senão próximos 10 dias úteis."""
+    if DIAS_ALVO_RAW.strip():
+        # Usa datas específicas do .env
+        datas = [d.strip() for d in DIAS_ALVO_RAW.split(",") if d.strip()]
+        logger.info(f"Usando datas específicas: {datas}")
+        return datas
+    
+    # Comportamento padrão: próximos 10 dias, excluindo DOM (6)
+    hoje = datetime.now()
+    datas = []
+    for i in range(1, 11):
+        d = hoje + timedelta(days=i)
+        if d.weekday() != 6:
+            datas.append(d.strftime("%d/%m/%Y"))
+    return datas
+
+def fazer_requisicao_com_retry(url: str, payload: list, headers: dict) -> requests.Response | None:
+    """Faz requisição com retry e backoff exponencial."""
+    for tentativa in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.Timeout:
+            wait_time = BACKOFF_BASE * (2 ** (tentativa - 1))
+            logger.warning(f"Timeout (tentativa {tentativa}/{MAX_RETRIES}). Aguardando {wait_time}s...")
+            if tentativa < MAX_RETRIES:
+                time.sleep(wait_time)
+        except requests.exceptions.RequestException as e:
+            wait_time = BACKOFF_BASE * (2 ** (tentativa - 1))
+            logger.warning(f"Erro de rede: {e} (tentativa {tentativa}/{MAX_RETRIES}). Aguardando {wait_time}s...")
+            if tentativa < MAX_RETRIES:
+                time.sleep(wait_time)
+    return None
+
 def verificar_vagas() -> bool:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -110,21 +150,18 @@ def verificar_vagas() -> bool:
         "Accept": "text/plain, */*; q=0.01",
     }
 
-    hoje = datetime.now()
-    datas_para_testar = []
-    
-    # Próximos 10 dias, excluindo DOM (6)
-    for i in range(1, 11):
-        d = hoje + timedelta(days=i)
-        if d.weekday() != 6: 
-            datas_para_testar.append(d.strftime("%d/%m/%Y"))
+    datas_para_testar = obter_datas_alvo()
 
     for data_ddmmyyyy in datas_para_testar:
         payload = montar_payload(UNIDADE, SERVICO, data_ddmmyyyy)
 
+        r = fazer_requisicao_com_retry(URL_AGENDAMENTO, payload, headers)
+        if r is None:
+            logger.error(f"Falha após {MAX_RETRIES} tentativas para {data_ddmmyyyy}. Pulando...")
+            time.sleep(INTERVALO_ENTRE_DATAS)
+            continue
+
         try:
-            r = requests.post(URL_AGENDAMENTO, data=payload, headers=headers, timeout=10)
-            r.raise_for_status()
 
             tem_vaga, status_msg = interpretar_resposta(r)
 
@@ -146,10 +183,8 @@ def verificar_vagas() -> bool:
             # Sem vaga (ou não liberado) — loga o motivo
             logger.info(f"{data_ddmmyyyy}: {status_msg}")
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Erro ao testar {data_ddmmyyyy}: {e}")
         except Exception as e:
-            logger.error(f"Erro inesperado ao testar {data_ddmmyyyy}: {e}")
+            logger.error(f"Erro inesperado ao processar resposta de {data_ddmmyyyy}: {e}")
 
         time.sleep(INTERVALO_ENTRE_DATAS)
 

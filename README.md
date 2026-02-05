@@ -27,6 +27,9 @@ TOKEN_TELEGRAM=seu_token_aqui
 CHAT_ID=seu_chat_id_aqui
 UNIDADE=85  # (Opcional) ID da unidade. Padrão 85 = Viva Penalva
 SERVICO=316 # (Opcional) ID do serviço. Padrão 316 = RG Nacional (CIN)
+REQUEST_TIMEOUT=30   # (Opcional) Timeout em segundos. Padrão 30
+MAX_RETRIES=3        # (Opcional) Tentativas por data. Padrão 3
+DIAS_ALVO=06/02/2026,07/02/2026  # (Opcional) Datas específicas a verificar (DD/MM/YYYY)
 ```
 
 ## Instalação e Execução
